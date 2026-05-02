@@ -59,6 +59,14 @@ echo "    Build args (sorted)  : $ARGS_FLAT" >&2
 echo "    Base image digest    : $BASE_DIGEST" >&2
 echo "    Build hash           : $BUILD_HASH" >&2
 
+# Look for the build-hash in three places, in order:
+#   1. Manifest annotations (where buildx puts `--annotation index:KEY=VAL`)
+#   2. Per-arch manifest annotations
+#   3. Image config Labels (where docker/build-push-action `labels:` go).
+# We use both because docker/build-push-action's `annotations:` input is
+# applied at the manifest level by default, but `labels:` lands in the
+# image config blob — and which one survives the round-trip can depend
+# on the registry implementation. Belt + suspenders.
 EXISTING_HASH=""
 if EXISTING_JSON="$(docker buildx imagetools inspect "$IMAGE_REF" --raw 2>/dev/null)"; then
   EXISTING_HASH="$(jq -r '
@@ -66,6 +74,20 @@ if EXISTING_JSON="$(docker buildx imagetools inspect "$IMAGE_REF" --raw 2>/dev/n
     // (.manifests[0].annotations // {})["org.bitsnbites.build-hash"]
     // ""
   ' <<<"$EXISTING_JSON")"
+fi
+if [[ -z "$EXISTING_HASH" ]]; then
+  # Fall back: ask buildx for the image config (Labels live there).
+  # `imagetools inspect --format` evaluates a Go template against the
+  # multi-arch index. {{json .Image}} prints a per-arch map of OCI
+  # image configs — extract any non-empty build-hash label.
+  if CFG_JSON="$(docker buildx imagetools inspect "$IMAGE_REF" \
+      --format '{{json .Image}}' 2>/dev/null)"; then
+    EXISTING_HASH="$(jq -r '
+      [.. | objects | .config?.Labels?["org.bitsnbites.build-hash"]?]
+      | map(select(. != null and . != ""))
+      | first // ""
+    ' <<<"$CFG_JSON" 2>/dev/null || echo "")"
+  fi
 fi
 echo "    Previously published : ${EXISTING_HASH:-<none>}" >&2
 
