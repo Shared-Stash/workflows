@@ -3,3 +3,5 @@
 .matrix.json
 .deprecated.json
 .cleaned.json
+__pycache__/
+*.pyc
