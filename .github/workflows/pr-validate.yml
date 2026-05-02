@@ -1,0 +1,111 @@
+name: Validate Image PR (reusable)
+
+# Reusable workflow that lints + smoke-builds an image PR. Pairs with
+# ci-image.yml — same versions config, but only the FIRST resolved combo
+# is built (no push, amd64 only) just to confirm the change still produces
+# a working image.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        type: string
+        required: true
+      versions_config_path:
+        description: "Path (in calling repo) to the versions config consumed by get-versions.py"
+        type: string
+        default: "versions.yml"
+      dockerfile_path:
+        type: string
+        default: "Dockerfile"
+      context_path:
+        type: string
+        default: "."
+      smoke_command:
+        description: "Command run inside the built image to verify it works."
+        type: string
+        default: "true"
+      workflows_repo:
+        type: string
+        default: "Shared-Stash/workflows"
+      workflows_ref:
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ inputs.dockerfile_path }}
+          failure-threshold: warning
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+
+  smoke-build:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout workflows repo (for shared scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.workflows_repo }}
+          ref: ${{ inputs.workflows_ref }}
+          path: .ci-workflows
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Resolve matrix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .ci-workflows/scripts/get-versions.py \
+            --config "${{ inputs.versions_config_path }}" \
+            --out .matrix.json
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compose build-args from first matrix entry
+        id: bargs
+        run: |
+          first_args="$(jq -c '.include[0].build_args' .matrix.json)"
+          tag_key="$(jq -r '.include[0].tag_key' .matrix.json)"
+          {
+            echo 'build_args<<EOF'
+            jq -r 'to_entries | .[] | "\(.key)=\(.value)"' <<<"$first_args"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          echo "tag_key=$tag_key" >> "$GITHUB_OUTPUT"
+
+      - name: Build (no push, amd64 only)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: pr-test/${{ inputs.image_name }}:${{ steps.bargs.outputs.tag_key }}
+          build-args: ${{ steps.bargs.outputs.build_args }}
+
+      - name: Smoke test
+        run: |
+          docker run --rm \
+            "pr-test/${{ inputs.image_name }}:${{ steps.bargs.outputs.tag_key }}" \
+            bash -lc '${{ inputs.smoke_command }}'

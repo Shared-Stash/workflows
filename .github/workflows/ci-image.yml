@@ -1,0 +1,377 @@
+name: Build CI Image (reusable)
+
+# Reusable workflow that drives the full lifecycle for a CI Docker image:
+#   1. resolve-matrix - run get-versions.py against the calling repo's
+#                       versions.yml to produce the supported matrix
+#   2. build          - matrix-fans-out, skip-if-unchanged gate, multi-arch
+#                       buildx, push to ghcr.io and (optionally) docker.io
+#   3. deprecate      - diffs registry against the supported matrix,
+#                       annotates dropped tags + pushes <tag>-deprecated aliases
+#   4. cleanup        - hard-deletes any -deprecated tag whose deprecated.at
+#                       label is older than retention_days
+#
+# How to call this workflow from an image repo (full example):
+#
+#   jobs:
+#     ci:
+#       uses: Shared-Stash/workflows/.github/workflows/ci-image.yml@main
+#       with:
+#         image_name: playwright
+#       secrets:
+#         DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+#         DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
+#
+# The calling repo only needs:
+#   - Dockerfile        (built per matrix entry)
+#   - versions.yml      (declares axes + tag templates + build_args)
+#
+# That's it. Everything else (matrix resolution, skip-gate, deprecation,
+# cleanup) lives here.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name (no namespace, e.g. 'playwright')"
+        type: string
+        required: true
+      versions_config_path:
+        description: "Path (in calling repo) to the versions config consumed by get-versions.py"
+        type: string
+        default: "versions.yml"
+      dockerfile_path:
+        description: "Path to Dockerfile in the calling repo"
+        type: string
+        default: "Dockerfile"
+      context_path:
+        description: "Build context in the calling repo"
+        type: string
+        default: "."
+      ghcr_owner:
+        # Must match the GitHub org running this workflow — GHCR auth via
+        # GITHUB_TOKEN can only push to its own org's namespace.
+        type: string
+        default: "shared-stash"
+      dockerhub_namespace:
+        type: string
+        default: "bitsnbites"
+      push_to_dockerhub:
+        type: boolean
+        default: true
+      platforms:
+        type: string
+        default: "linux/amd64,linux/arm64"
+      retention_days:
+        type: number
+        default: 90
+      tag_pattern:
+        description: "Regex matching version-like tags considered for deprecation"
+        type: string
+        default: "^[0-9]+(\\.[0-9]+){1,2}-.+$"
+      dry_run_cleanup:
+        type: boolean
+        default: false
+      force_build:
+        type: boolean
+        default: false
+      workflows_repo:
+        description: "Repo hosting the reusable workflows + scripts"
+        type: string
+        default: "Shared-Stash/workflows"
+      workflows_ref:
+        description: "Ref of workflows_repo to check out for the scripts"
+        type: string
+        default: "main"
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------- 1
+  resolve-matrix:
+    name: Resolve supported matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.r.outputs.matrix }}
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workflows repo (for shared scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.workflows_repo }}
+          ref: ${{ inputs.workflows_ref }}
+          path: .ci-workflows
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Resolve versions
+        id: r
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .ci-workflows/scripts/get-versions.py \
+            --config "${{ inputs.versions_config_path }}" \
+            --out .matrix.json
+          echo "matrix=$(jq -c . .matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload matrix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ inputs.image_name }}
+          path: .matrix.json
+
+  # ---------------------------------------------------------------- 2
+  build:
+    name: build ${{ matrix.tag_key }}
+    needs: resolve-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workflows repo (for shared scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.workflows_repo }}
+          ref: ${{ inputs.workflows_ref }}
+          path: .ci-workflows
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: inputs.push_to_dockerhub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Skip-build gate
+        id: gate
+        env:
+          IMAGE_REF: ghcr.io/${{ inputs.ghcr_owner }}/${{ inputs.image_name }}:${{ matrix.tag_key }}
+          BUILD_ARGS_JSON: ${{ toJSON(matrix.build_args) }}
+          DOCKERFILE: ${{ inputs.dockerfile_path }}
+        run: |
+          chmod +x .ci-workflows/scripts/should-build.sh
+          decision="$(.ci-workflows/scripts/should-build.sh)"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "Build decision: $decision"
+
+      - name: Compose tag list
+        id: tags
+        env:
+          TAGS_CSV: ${{ join(matrix.tags, ',') }}
+        run: |
+          ghcr="ghcr.io/${{ inputs.ghcr_owner }}/${{ inputs.image_name }}"
+          hub="docker.io/${{ inputs.dockerhub_namespace }}/${{ inputs.image_name }}"
+          out=""
+          IFS=',' read -ra arr <<< "$TAGS_CSV"
+          for t in "${arr[@]}"; do
+            out="${out}${ghcr}:${t},"
+            if [[ "${{ inputs.push_to_dockerhub }}" == "true" ]]; then
+              out="${out}${hub}:${t},"
+            fi
+          done
+          out="${out%,}"
+          echo "value=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Compose build-args list
+        id: bargs
+        env:
+          BUILD_ARGS_JSON: ${{ toJSON(matrix.build_args) }}
+        run: |
+          {
+            echo 'value<<EOF'
+            jq -r 'to_entries | .[] | "\(.key)=\(.value)"' <<<"$BUILD_ARGS_JSON"
+            echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "VCS_REF=${{ github.sha }}"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        if: steps.gate.outputs.decision == 'build' || inputs.force_build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.tags.outputs.value }}
+          build-args: ${{ steps.bargs.outputs.value }}
+          labels: |
+            org.bitsnbites.build-hash=${{ steps.gate.outputs.build_hash }}
+          annotations: |
+            org.bitsnbites.build-hash=${{ steps.gate.outputs.build_hash }}
+          cache-from: type=gha,scope=${{ inputs.image_name }}-${{ matrix.tag_key }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image_name }}-${{ matrix.tag_key }}
+
+      - name: Skipped (no input changed)
+        if: steps.gate.outputs.decision == 'skip' && !inputs.force_build
+        run: echo "Nothing changed for ${{ matrix.tag_key }} — skip build & push."
+
+  # ---------------------------------------------------------------- 3
+  deprecate:
+    name: Mark dropped combos as deprecated
+    needs: [resolve-matrix, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.workflows_repo }}
+          ref: ${{ inputs.workflows_ref }}
+          path: .ci-workflows
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: inputs.push_to_dockerhub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Materialize matrix
+        run: |
+          cat > .matrix.json <<'JSON'
+          ${{ needs.resolve-matrix.outputs.matrix }}
+          JSON
+          jq '.' .matrix.json > /dev/null
+
+      - name: Compute deprecation list
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+          GHCR_OWNER: ${{ inputs.ghcr_owner }}
+          DOCKERHUB_NAMESPACE: ${{ inputs.dockerhub_namespace }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_PATTERN: ${{ inputs.tag_pattern }}
+        run: |
+          chmod +x .ci-workflows/scripts/find-deprecated.sh
+          .ci-workflows/scripts/find-deprecated.sh
+
+      - name: Annotate + alias each deprecated tag
+        run: |
+          today="$(date -u +%Y-%m-%d)"
+          jq -c '.deprecate[]' .deprecated.json | while read -r row; do
+            tag="$(jq -r '.tag' <<<"$row")"
+            reason="$(jq -r '.reason' <<<"$row")"
+
+            for reg in "ghcr.io/${{ inputs.ghcr_owner }}/${{ inputs.image_name }}" \
+                       "docker.io/${{ inputs.dockerhub_namespace }}/${{ inputs.image_name }}"
+            do
+              if [[ "$reg" == docker.io/* && "${{ inputs.push_to_dockerhub }}" != "true" ]]; then
+                continue
+              fi
+              src="${reg}:${tag}"
+              echo "==> Deprecating ${src}"
+              if ! docker buildx imagetools inspect "$src" >/dev/null 2>&1; then
+                echo "    skip: ${src} not present"
+                continue
+              fi
+              docker buildx imagetools create \
+                --annotation "index:org.opencontainers.image.deprecated=true" \
+                --annotation "index:org.bitsnbites.deprecated.at=${today}" \
+                --annotation "index:org.bitsnbites.deprecated.reason=${reason}" \
+                --tag "${reg}:${tag}" \
+                --tag "${reg}:${tag}-deprecated" \
+                "$src"
+            done
+          done
+
+  # ---------------------------------------------------------------- 4
+  cleanup:
+    name: Hard-delete tags deprecated > ${{ inputs.retention_days }} days
+    needs: deprecate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.workflows_repo }}
+          ref: ${{ inputs.workflows_ref }}
+          path: .ci-workflows
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: inputs.push_to_dockerhub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Acquire Docker Hub JWT
+        if: inputs.push_to_dockerhub
+        id: hubjwt
+        run: |
+          jwt="$(curl -fsSL -H 'Content-Type: application/json' \
+            -d "{\"username\":\"${{ secrets.DOCKERHUB_USERNAME }}\",\"password\":\"${{ secrets.DOCKERHUB_TOKEN }}\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r .token)"
+          echo "::add-mask::$jwt"
+          echo "jwt=$jwt" >> "$GITHUB_OUTPUT"
+
+      - name: Sweep deprecated tags
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+          GHCR_OWNER: ${{ inputs.ghcr_owner }}
+          DOCKERHUB_NAMESPACE: ${{ inputs.dockerhub_namespace }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_TOKEN: ${{ steps.hubjwt.outputs.jwt }}
+          RETENTION_DAYS: ${{ inputs.retention_days }}
+          DRY_RUN: ${{ inputs.dry_run_cleanup && 'true' || 'false' }}
+        run: |
+          chmod +x .ci-workflows/scripts/cleanup-deprecated.sh
+          .ci-workflows/scripts/cleanup-deprecated.sh
+
+      - name: Upload cleanup report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-report-${{ inputs.image_name }}
+          path: .cleaned.json
+          if-no-files-found: ignore
