@@ -53,6 +53,22 @@ list_ghcr_tags() {
     echo "    GHCR: no GITHUB_TOKEN — skipping" >&2
     return 0
   fi
+
+  # Try org endpoint first; fall back to user endpoint. GitHub stores
+  # org-owned and user-owned packages under different paths and there's
+  # no single endpoint that covers both.
+  local owner_kind="orgs"
+  local probe_status
+  probe_status="$(curl -fso /dev/null -w '%{http_code}' \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/orgs/${OWNER}/packages/container/${IMAGE_NAME}" || echo 000)"
+  if [[ "$probe_status" == "404" ]]; then
+    owner_kind="users"
+  fi
+  echo "    GHCR: using /${owner_kind}/${OWNER}/packages/container/${IMAGE_NAME}" >&2
+
   local page=1
   while :; do
     local resp
@@ -60,7 +76,7 @@ list_ghcr_tags() {
       -H "Accept: application/vnd.github+json" \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
-      "https://api.github.com/users/${OWNER}/packages/container/${IMAGE_NAME}/versions?per_page=100&page=${page}" \
+      "https://api.github.com/${owner_kind}/${OWNER}/packages/container/${IMAGE_NAME}/versions?per_page=100&page=${page}" \
       || echo '[]')"
     local count
     count="$(jq 'length' <<<"$resp")"
@@ -86,10 +102,12 @@ list_ghcr_tags || true
 echo "==> Listing Docker Hub tags (${HUB_NS}/${IMAGE_NAME})"
 list_dockerhub_tags || true
 
-PUBLISHED="$(sort -u "$TAGS_FILE" \
+# grep returns 1 when nothing matches (which is fine: empty registry on
+# first run, or no version-like tags yet). `|| true` keeps `set -e` happy.
+PUBLISHED="$( { sort -u "$TAGS_FILE" \
   | grep -E "$TAG_PATTERN" \
   | grep -v -- '-deprecated$' \
-  | jq -R . | jq -s '. // []')"
+  || true; } | jq -R . | jq -s '. // []')"
 
 PUBLISHED_COUNT="$(jq 'length' <<<"$PUBLISHED")"
 echo "    found ${PUBLISHED_COUNT} version-like published tag(s) (pattern: ${TAG_PATTERN})"

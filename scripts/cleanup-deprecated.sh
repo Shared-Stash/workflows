@@ -44,13 +44,26 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   echo "    GHCR: no GITHUB_TOKEN — skipping" >&2
 else
   echo "==> Scanning GHCR (${OWNER}/${IMAGE})"
+
+  # Try org endpoint first; fall back to user endpoint.
+  owner_kind="orgs"
+  probe_status="$(curl -fso /dev/null -w '%{http_code}' \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/orgs/${OWNER}/packages/container/${IMAGE}" || echo 000)"
+  if [[ "$probe_status" == "404" ]]; then
+    owner_kind="users"
+  fi
+  echo "    using /${owner_kind}/${OWNER}/packages/container/${IMAGE}" >&2
+
   page=1
   while :; do
     versions="$(curl -fsSL \
       -H "Accept: application/vnd.github+json" \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
-      "https://api.github.com/users/${OWNER}/packages/container/${IMAGE}/versions?per_page=100&page=${page}" \
+      "https://api.github.com/${owner_kind}/${OWNER}/packages/container/${IMAGE}/versions?per_page=100&page=${page}" \
       || echo '[]')"
     count="$(jq 'length' <<<"$versions")"
     [[ "$count" -eq 0 ]] && break
@@ -94,7 +107,7 @@ else
           -H "Accept: application/vnd.github+json" \
           -H "Authorization: Bearer ${GITHUB_TOKEN}" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
-          "https://api.github.com/users/${OWNER}/packages/container/${IMAGE}/versions/${version_id}" \
+          "https://api.github.com/${owner_kind}/${OWNER}/packages/container/${IMAGE}/versions/${version_id}" \
           >/dev/null \
           || echo "    !! GHCR delete failed for version ${version_id}" >&2
       fi
